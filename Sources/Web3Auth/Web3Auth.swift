@@ -73,8 +73,7 @@ public class Web3Auth: NSObject {
         self.state = nil
     }
 
-    public func getLoginId<T: Encodable>(data: T) async throws -> String? {
-        let sessionId = try SessionManager.generateRandomSessionID()!
+    public func getLoginId<T: Encodable>(sessionId: String, data: T) async throws -> String? {
         sessionManager.setSessionId(sessionId: sessionId)
         return try await sessionManager.createSession(data: data)
     }
@@ -168,8 +167,8 @@ public class Web3Auth: NSObject {
         }
 
         let sdkUrlParams = SdkUrlParams(options: initParams, params: w3ALoginParams!, actionType: "login")
-
-        let loginId = try await getLoginId(data: sdkUrlParams)
+        let sessionId = try SessionManager.generateRandomSessionID()!
+        let loginId = try await getLoginId(sessionId: sessionId, data: sdkUrlParams)
 
         let jsonObject: [String: String?] = [
             "loginId": loginId,
@@ -267,7 +266,112 @@ public class Web3Auth: NSObject {
             ]
 
             let setUpMFAParams = SetUpMFAParams(options: initParams, params: params, actionType: "enable_mfa", sessionId: sessionId)
-            let loginId = try await getLoginId(data: setUpMFAParams)
+            let sessionId = try SessionManager.generateRandomSessionID()!
+            let loginId = try await getLoginId(sessionId: sessionId, data: setUpMFAParams)
+
+            let jsonObject: [String: String?] = [
+                "loginId": loginId,
+            ]
+
+            let url = try Web3Auth.generateAuthSessionURL(initParams: initParams, jsonObject: jsonObject, sdkUrl: initParams.sdkUrl?.absoluteString, path: "start")
+
+            return try await withCheckedThrowingContinuation({ (continuation: CheckedContinuation<Bool, Error>) in
+
+                DispatchQueue.main.async { // Ensure UI-related calls are made on the main thread
+                    self.authSession = ASWebAuthenticationSession(
+                        url: url, callbackURLScheme:  URL(string: redirectUrl!)?.scheme
+                    ) { callbackURL, authError in
+                        guard
+                            authError == nil,
+                            let callbackURL = callbackURL,
+                            let sessionResponse = try? Web3Auth.decodeStateFromCallbackURL(callbackURL)
+                        else {
+                            let authError = authError ?? Web3AuthError.unknownError
+                            if case ASWebAuthenticationSessionError.canceledLogin = authError {
+                                continuation.resume(throwing: Web3AuthError.userCancelled)
+                            } else {
+                                continuation.resume(throwing: authError)
+                            }
+                            return
+                        }
+
+                        let sessionId = sessionResponse.sessionId
+                        self.sessionManager.setSessionId(sessionId: sessionId)
+                        SessionManager.saveSessionIdToStorage(sessionId)
+
+                        Task {
+                            do {
+                                let loginDetails = try await self.getLoginDetails(callbackURL)
+                                if let safeUserInfo = loginDetails.userInfo {
+                                    KeychainManager.shared.saveDappShare(userInfo: safeUserInfo)
+                                }
+                                self.state = loginDetails
+                                continuation.resume(returning: true)
+                            } catch {
+                                continuation.resume(throwing: Web3AuthError.unknownError)
+                            }
+                        }
+                    }
+                    self.authSession?.presentationContextProvider = self
+
+                    if !(self.authSession?.start() ?? false) {
+                        continuation.resume(throwing: Web3AuthError.unknownError)
+                    }
+                }
+            })
+        } else {
+            throw Web3AuthError.runtimeError("SessionId not found. Please login first.")
+        }
+    }
+    
+    public func manageMFA(_ loginParams: W3ALoginParams? = nil) async throws -> Bool {
+        // Note that this function can be called without login on restored session, so loginParams should not be optional.
+        if state?.userInfo?.isMfaEnabled == false {
+            throw Web3AuthError.mfaNotEnabled
+        }
+        let sessionId = sessionManager.getSessionId()
+        if !sessionId.isEmpty {
+            if loginParams != nil {
+                self.w3ALoginParams = loginParams
+                w3ALoginParams?.redirectUrl = initParams.dashboardUrl?.absoluteString
+            }
+            var extraLoginOptions: ExtraLoginOptions? = ExtraLoginOptions()
+            if loginParams?.extraLoginOptions != nil {
+                extraLoginOptions = loginParams?.extraLoginOptions
+            } else {
+                extraLoginOptions = w3ALoginParams?.extraLoginOptions
+            }
+            extraLoginOptions?.login_hint = state?.userInfo?.verifierId
+
+            let jsonData = try? JSONEncoder().encode(extraLoginOptions)
+            let _extraLoginOptions = String(data: jsonData!, encoding: .utf8)
+            
+            let redirectUrl = if self.w3ALoginParams != nil {
+                self.w3ALoginParams?.redirectUrl
+            } else {
+                initParams.redirectUrl
+            }
+            
+            let sessionId = try SessionManager.generateRandomSessionID()!
+            let loginIdObject: [String: String?] = [
+                "loginId": sessionId,
+            ]
+            
+            let jsonEncoder = JSONEncoder()
+            let data = try? jsonEncoder.encode(loginIdObject)
+            
+            let params: [String: String?] = [
+                "loginProvider": state?.userInfo?.typeOfLogin,
+                "mfaLevel": MFALevel.MANDATORY.rawValue,
+                "redirectUrl": initParams.dashboardUrl?.absoluteString,
+                "extraLoginOptions": _extraLoginOptions,
+                "appState": data!.toBase64URL()
+            ]
+            
+            initParams.redirectUrl = initParams.dashboardUrl!.absoluteString
+
+            let setUpMFAParams = SetUpMFAParams(options: initParams, params: params, actionType: "manage_mfa", sessionId: sessionManager.getSessionId())
+            let loginId = try await getLoginId(sessionId: sessionId, data: setUpMFAParams)
 
             let jsonObject: [String: String?] = [
                 "loginId": loginId,
@@ -329,8 +433,8 @@ public class Web3Auth: NSObject {
         if !sessionId.isEmpty {
             initParams.chainConfig = chainConfig
             let walletServicesParams = WalletServicesParams(options: initParams, appState: nil)
-
-            let loginId = try await getLoginId(data: walletServicesParams)
+            let sessionId = try SessionManager.generateRandomSessionID()!
+            let loginId = try await getLoginId(sessionId: sessionId ,data: walletServicesParams)
 
             let jsonObject: [String: String?] = [
                 "loginId": loginId,
@@ -365,11 +469,11 @@ public class Web3Auth: NSObject {
             initParams.chainConfig = chainConfig
 
             let walletServicesParams = WalletServicesParams(options: initParams, appState: appState)
-
-            let loginId = try await getLoginId(data: walletServicesParams)
+            let loginId = try SessionManager.generateRandomSessionID()!
+            let _loginId = try await getLoginId(sessionId: loginId, data: walletServicesParams)
 
             var signMessageMap: [String: String] = [:]
-            signMessageMap["loginId"] = loginId
+            signMessageMap["loginId"] = _loginId
             signMessageMap["sessionId"] = sessionId
             signMessageMap["platform"] = "ios"
             signMessageMap["appState"] = appState
